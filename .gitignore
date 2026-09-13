@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+coverage/
+*.log
+
+backend/.venv/
+backend/uploads/
+
+frontend/.vite/
+backups/
