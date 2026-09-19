@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+CONNECTION_COLORS = {"#202124", "#6b7280", "#d64545", "#2864c7"}
+DEFAULT_CONNECTION_COLOR = "#6b7280"
 
 
 class ORMModel(BaseModel):
@@ -95,6 +99,8 @@ class DeviceCreate(BaseModel):
     image_url: str = ""
     canvas_width: int = Field(default=8, ge=2, le=40)
     canvas_height: int = Field(default=3, ge=2, le=20)
+    cell_width: int = Field(default=64, ge=24, le=240)
+    cell_height: int = Field(default=52, ge=24, le=180)
 
 
 class DeviceRead(ORMModel):
@@ -114,11 +120,14 @@ class DeviceRead(ORMModel):
     image_url: str
     canvas_width: int
     canvas_height: int
+    cell_width: int
+    cell_height: int
 
 
 class PortCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     port_type: str = "网口"
+    side: str = "front"
     position: int = Field(default=0, ge=0)
     grid_x: int = Field(default=0, ge=0, le=40)
     grid_y: int = Field(default=0, ge=0, le=20)
@@ -126,10 +135,11 @@ class PortCreate(BaseModel):
 
 
 class PortBatchCreate(BaseModel):
-    prefix: str = Field(default="GE1/0/", min_length=1, max_length=60)
+    prefix: str = Field(default="PORT-", min_length=1, max_length=60)
     start_number: int = Field(default=1, ge=0)
     count: int = Field(default=24, ge=1, le=256)
     port_type: str = "网口"
+    side: str = "front"
     position_start: int = Field(default=0, ge=0)
     note: str = ""
 
@@ -139,6 +149,7 @@ class PortRead(ORMModel):
     device_id: int
     name: str
     port_type: str
+    side: str
     position: int
     note: str
     grid_x: int
@@ -150,8 +161,13 @@ class ConnectionCreate(BaseModel):
     target_port_id: int
     name: str = ""
     cable_type: str = "网线"
-    color: str = "#2f7d87"
+    color: str = DEFAULT_CONNECTION_COLOR
     note: str = ""
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def normalize_color(cls, value: str) -> str:
+        return value if value in CONNECTION_COLORS else DEFAULT_CONNECTION_COLOR
 
 
 class CabinetImport(CabinetCreate):

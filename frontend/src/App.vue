@@ -3,20 +3,38 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { UploadFile } from "element-plus";
 import {
+  ArrowDown,
   ArrowRight,
-  Connection as ConnectionIcon,
+  ArrowUp,
+  Box,
   Delete,
   Edit,
-  Expand,
-  Link,
+  EditPen,
+  Grid,
+  House,
   MapLocation,
   Plus,
-  Search,
-  Setting,
-  ZoomIn,
-  ZoomOut
+  View,
 } from "@element-plus/icons-vue";
 import { api, uploadImage } from "./api";
+import {
+  CABINET_CANVAS_SIZE,
+  CONNECTION_COLORS,
+  DEFAULT_CONNECTION_COLOR,
+  DEVICE_CELL,
+  DEVICE_PADDING,
+  GRID_SIZE,
+  RACK_UNIT_PX,
+  ROOM_MIN_SIZE,
+  ROOM_PADDING,
+  VIEW_STATE_PREFIX
+} from "./constants";
+import { connectionCurve as buildConnectionCurve, portPoint as getPortPoint } from "./canvas-geometry";
+import { markdownToHtml } from "./markdown";
+import type { ConnectionForm, DeviceFace, SearchResults, ServiceState, ViewMode } from "./domain";
+import { useServiceHealth } from "./composables/useServiceHealth";
+import AppTopbar from "./components/AppTopbar.vue";
+import ViewToolbar from "./components/ViewToolbar.vue";
 import type {
   Cabinet,
   Connection,
@@ -28,15 +46,11 @@ import type {
   ViewItem
 } from "./types";
 
-type ViewMode = "room" | "cabinet" | "device";
-type ServiceState = "checking" | "ok" | "error";
-type SearchResults = { rooms: Room[]; cabinets: Cabinet[]; devices: Device[]; ports: Port[] };
-
-const apiState = ref<ServiceState>("checking");
-const dbState = ref<ServiceState>("checking");
+const { apiState, dbState, ready: serviceReady, label: serviceLabel, checkHealth } = useServiceHealth();
 const loading = ref(true);
 const saving = ref(false);
 const viewMode = ref<ViewMode>("room");
+const deviceFace = ref<DeviceFace>("front");
 const zoom = ref(1);
 const pan = ref({ x: 0, y: 0 });
 const snapToGrid = ref(true);
@@ -54,6 +68,7 @@ const viewItems = ref<ViewItem[]>([]);
 const selectedCabinet = ref<Cabinet>();
 const selectedDevice = ref<Device>();
 const selectedPort = ref<Port>();
+const suppressNextDeviceClick = ref(false);
 const connectionDialog = ref(false);
 const editingConnectionId = ref(0);
 const portDragState = ref<{ source: Port; point: { x: number; y: number } }>();
@@ -62,8 +77,7 @@ const searchQuery = ref("");
 const searchResults = ref<SearchResults>();
 const searchOpen = ref(false);
 const topologyDialog = ref(false);
-const topologyRootPort = ref<Port>();
-const importInput = ref<HTMLInputElement>();
+const topologyConnection = ref<Connection>();
 
 const projectDialog = ref(false);
 const roomDialog = ref(false);
@@ -72,7 +86,7 @@ const deviceDialog = ref(false);
 const portDialog = ref(false);
 const portBatchDialog = ref(false);
 const projectForm = ref({ name: "", code: "", description: "" });
-const roomForm = ref({ name: "", code: "", width: 1200, height: 800, note: "" });
+const roomForm = ref({ name: "", code: "", note: "" });
 const cabinetForm = ref({ name: "", code: "", height_u: 42, note: "" });
 const deviceForm = ref({
   name: "",
@@ -86,13 +100,15 @@ const deviceForm = ref({
   side: "front",
   status: "在用",
   note: "",
-  image_url: "",
   canvas_width: 8,
   canvas_height: 3
 });
+const deviceNoteTab = ref<"edit" | "preview">("edit");
+const deviceNoteExpanded = ref(false);
 const portForm = ref({
   name: "",
   port_type: "网口",
+  side: "front",
   position: 0,
   grid_x: 0,
   grid_y: 0,
@@ -103,34 +119,33 @@ const portBatchForm = ref<PortBatchCreate>({
   start_number: 1,
   count: 24,
   port_type: "网口",
+  side: "front",
   position_start: 0,
   note: ""
 });
-const connectionForm = ref({
+const connectionForm = ref<ConnectionForm>({
   source_port_id: 0,
   target_port_id: 0,
   name: "",
   cable_type: "网线",
-  color: "#2f7d87",
+  color: DEFAULT_CONNECTION_COLOR,
   note: ""
 });
 const editingIds = ref({ project: 0, room: 0, cabinet: 0, device: 0, port: 0 });
-const GRID_SIZE = 20;
-const CABINET_CANVAS_SIZE = { width: 132, height: 270 };
-const DEVICE_CELL = { width: 64, height: 52 };
-const DEVICE_PADDING = { x: 36, y: 92 };
-const VIEW_STATE_PREFIX = "device-wiring-view:";
-
 const currentProject = computed(() => projects.value[0]);
 const currentRoom = computed(() => rooms.value[0]);
-const serviceReady = computed(() => apiState.value === "ok" && dbState.value === "ok");
-const serviceLabel = computed(() =>
-  apiState.value === "checking" || dbState.value === "checking"
-    ? "检查中"
-    : serviceReady.value
-      ? "已连接"
-      : "连接异常"
-);
+const roomCanvasSize = computed(() => {
+  const maxX = cabinets.value.length
+    ? Math.max(...cabinets.value.map((cabinet) => cabinet.x + CABINET_CANVAS_SIZE.width))
+    : 0;
+  const maxY = cabinets.value.length
+    ? Math.max(...cabinets.value.map((cabinet) => cabinet.y + CABINET_CANVAS_SIZE.height))
+    : 0;
+  return {
+    width: Math.max(ROOM_MIN_SIZE.width, maxX + ROOM_PADDING.x),
+    height: Math.max(ROOM_MIN_SIZE.height, maxY + ROOM_PADDING.y)
+  };
+});
 const roomTitle = computed(() => currentRoom.value?.name ?? "未创建机房");
 const cabinetDevices = computed(() =>
   selectedCabinet.value
@@ -141,8 +156,16 @@ const selectedDevicePorts = computed(() =>
   selectedDevice.value
     ? ports.value
         .filter((port) => port.device_id === selectedDevice.value?.id)
-        .sort((left, right) => left.position - right.position || left.id - right.id)
+        .sort((left, right) =>
+          left.side.localeCompare(right.side) ||
+          left.grid_y - right.grid_y ||
+          left.grid_x - right.grid_x ||
+          left.id - right.id
+        )
     : []
+);
+const visibleDevicePorts = computed(() =>
+  selectedDevicePorts.value.filter((port) => (port.side || "front") === deviceFace.value)
 );
 const allPortsWithDevices = computed(() =>
   allPorts.value.map((port) => ({
@@ -150,10 +173,8 @@ const allPortsWithDevices = computed(() =>
     device: allDevices.value.find((device) => device.id === port.device_id)
   }))
 );
-const connectionTargetPorts = computed(() =>
-  allPortsWithDevices.value
-    .filter(({ port }) => port.device_id !== selectedDevice.value?.id)
-    .slice(0, 200)
+const connectionPortOptions = computed(() =>
+  allPortsWithDevices.value.filter(({ port }) => port.id !== connectionForm.value.source_port_id)
 );
 const visibleConnections = computed(() =>
   selectedDevice.value
@@ -163,6 +184,22 @@ const visibleConnections = computed(() =>
         )
       )
     : connections.value
+);
+const canvasConnections = computed(() =>
+  visibleConnections.value.filter((connection) =>
+    visibleDevicePorts.value.some(
+      (port) => port.id === connection.source_port_id || port.id === connection.target_port_id
+    )
+  )
+);
+const externalCanvasConnectionIds = computed(() =>
+  canvasConnections.value
+    .filter((connection) => {
+      const sourceVisible = visibleDevicePorts.value.some((port) => port.id === connection.source_port_id);
+      const targetVisible = visibleDevicePorts.value.some((port) => port.id === connection.target_port_id);
+      return !(sourceVisible && targetVisible);
+    })
+    .map((connection) => connection.id)
 );
 const connectedPortIds = computed(() => {
   const ids = new Set<number>();
@@ -176,55 +213,32 @@ const deviceCanvasWidth = computed(() =>
   Math.max(360, (selectedDevice.value?.canvas_width ?? 8) * DEVICE_CELL.width + DEVICE_PADDING.x * 2)
 );
 const deviceCanvasHeight = computed(() =>
-  Math.max(260, (selectedDevice.value?.canvas_height ?? 3) * DEVICE_CELL.height + DEVICE_PADDING.y + 64)
+  Math.max(
+    260,
+    (selectedDevice.value?.canvas_height ?? 3) * DEVICE_CELL.height + DEVICE_PADDING.y + 64
+  )
 );
-const topologySteps = computed(() => {
-  const root = topologyRootPort.value;
-  if (!root) return [];
-  const steps: Array<{
-    depth: number;
-    port: Port;
-    device?: Device;
-    connection?: Connection;
-    direction: "起点" | "上一跳" | "下一跳";
-  }> = [];
-  const queue = [{ portId: root.id, depth: 0, connection: undefined as Connection | undefined }];
-  const visited = new Set<number>([root.id]);
-  while (queue.length && steps.length < 24) {
-    const current = queue.shift()!;
-    const port = allPorts.value.find((item) => item.id === current.portId);
-    if (!port) continue;
-    steps.push({
-      depth: current.depth,
-      port,
-      device: allDevices.value.find((item) => item.id === port.device_id),
-      connection: current.connection,
-      direction:
-        current.depth === 0
-          ? "起点"
-          : current.connection?.source_port_id === current.portId
-            ? "下一跳"
-            : "上一跳"
-    });
-    if (current.depth >= 0) {
-      connections.value
-        .filter((connection) =>
-          connection.source_port_id === current.portId || connection.target_port_id === current.portId
-        )
-        .forEach((connection) => {
-          const peerId =
-            connection.source_port_id === current.portId
-              ? connection.target_port_id
-              : connection.source_port_id;
-          if (!visited.has(peerId)) {
-            visited.add(peerId);
-            queue.push({ portId: peerId, depth: current.depth + 1, connection });
-          }
-        });
-    }
-  }
-  return steps;
+const deviceCell = computed(() => DEVICE_CELL);
+const topologyDetail = computed(() => {
+  const connection = topologyConnection.value;
+  if (!connection) return undefined;
+  const sourcePort = allPorts.value.find((port) => port.id === connection.source_port_id);
+  const targetPort = allPorts.value.find((port) => port.id === connection.target_port_id);
+  if (!sourcePort || !targetPort) return undefined;
+  return {
+    connection,
+    sourcePort,
+    targetPort,
+    sourceDevice: allDevices.value.find((device) => device.id === sourcePort.device_id),
+    targetDevice: allDevices.value.find((device) => device.id === targetPort.device_id)
+  };
 });
+
+function normalizeConnection(connection: Connection): Connection {
+  return CONNECTION_COLORS.some((color) => color.value === connection.color)
+    ? connection
+    : { ...connection, color: DEFAULT_CONNECTION_COLOR };
+}
 
 function viewStateKey(roomId = currentRoom.value?.id): string {
   return roomId ? `${VIEW_STATE_PREFIX}${roomId}` : "";
@@ -262,23 +276,6 @@ function restoreViewState(): void {
   }
 }
 
-async function checkHealth(): Promise<void> {
-  apiState.value = "checking";
-  dbState.value = "checking";
-  try {
-    const apiHealth = await api.get<{ status: string }>("/api/health");
-    apiState.value = apiHealth.status === "ok" ? "ok" : "error";
-  } catch {
-    apiState.value = "error";
-  }
-  try {
-    const dbHealth = await api.get<{ status: string }>("/api/health/db");
-    dbState.value = dbHealth.status === "ok" ? "ok" : "error";
-  } catch {
-    dbState.value = "error";
-  }
-}
-
 async function loadWorkspace(): Promise<void> {
   loading.value = true;
   try {
@@ -313,9 +310,9 @@ async function loadWorkspace(): Promise<void> {
       const layout = cabinetLayouts.get(cabinet.id);
       return layout ? { ...cabinet, x: layout.x, y: layout.y } : cabinet;
     });
-    connections.value = await api.get<Connection[]>(
-      `/api/projects/${currentProject.value.id}/connections`
-    );
+    connections.value = (
+      await api.get<Connection[]>(`/api/projects/${currentProject.value.id}/connections`)
+    ).map(normalizeConnection);
     allDevices.value = await api.get<Device[]>(
       `/api/projects/${currentProject.value.id}/devices`
     );
@@ -349,8 +346,10 @@ async function loadCabinet(cabinet: Cabinet): Promise<void> {
   viewMode.value = "cabinet";
 }
 
-async function selectDevice(device: Device): Promise<void> {
+async function selectDevice(device: Device, face: "front" | "back" = "front"): Promise<void> {
   selectedDevice.value = device;
+  deviceFace.value = face;
+  deviceNoteExpanded.value = false;
   ports.value = allPorts.value.length
     ? allPorts.value.filter((port) => port.device_id === device.id)
     : await api.get<Port[]>(`/api/devices/${device.id}/ports`);
@@ -371,8 +370,7 @@ function resetView(): void {
 }
 
 function fitCanvas(): void {
-  const room = currentRoom.value;
-  if (!room || !cabinets.value.length) {
+  if (!currentRoom.value || !cabinets.value.length) {
     resetView();
     return;
   }
@@ -387,11 +385,14 @@ function fitCanvas(): void {
   );
   const contentWidth = Math.max(maxX - minX + padding * 2, 1);
   const contentHeight = Math.max(maxY - minY + padding * 2, 1);
-  const nextZoom = Math.min(room.width / contentWidth, room.height / contentHeight);
+  const nextZoom = Math.min(
+    roomCanvasSize.value.width / contentWidth,
+    roomCanvasSize.value.height / contentHeight
+  );
   zoom.value = Math.min(2.2, Math.max(0.55, Number(nextZoom.toFixed(2))));
   pan.value = {
-    x: room.width / 2 - ((minX + maxX) / 2) * zoom.value,
-    y: room.height / 2 - ((minY + maxY) / 2) * zoom.value
+    x: roomCanvasSize.value.width / 2 - ((minX + maxX) / 2) * zoom.value,
+    y: roomCanvasSize.value.height / 2 - ((minY + maxY) / 2) * zoom.value
   };
   persistViewState();
 }
@@ -444,11 +445,39 @@ function setViewMode(mode: ViewMode): void {
   }
 }
 
-let dragState: { id: number; offsetX: number; offsetY: number } | undefined;
+function sideLabel(side?: string): string {
+  return side === "back" ? "背面" : "正面";
+}
+
+function rackDeviceStyle(device: Device): Record<string, string> {
+  const top = (selectedCabinet.value?.height_u ?? 42) - device.start_u - device.height_u + 1;
+  return {
+    top: `${Math.max(0, top) * RACK_UNIT_PX}px`,
+    height: `${Math.max(1, device.height_u * RACK_UNIT_PX - 2)}px`
+  };
+}
+
+let dragState:
+  | {
+      id: number;
+      offsetX: number;
+      offsetY: number;
+      startX: number;
+      startY: number;
+      moved: boolean;
+    }
+  | undefined;
 function beginCabinetDrag(event: PointerEvent, cabinet: Cabinet): void {
   event.stopPropagation();
   const point = canvasPoint(event);
-  dragState = { id: cabinet.id, offsetX: point.x - cabinet.x, offsetY: point.y - cabinet.y };
+  dragState = {
+    id: cabinet.id,
+    offsetX: point.x - cabinet.x,
+    offsetY: point.y - cabinet.y,
+    startX: cabinet.x,
+    startY: cabinet.y,
+    moved: false
+  };
   selectedCabinet.value = cabinet;
   window.addEventListener("pointermove", moveCabinet);
   window.addEventListener("pointerup", endCabinetDrag, { once: true });
@@ -463,11 +492,9 @@ function moveCabinet(event: PointerEvent): void {
   const rawY = point.y - dragState.offsetY;
   const snappedX = snapToGrid.value ? Math.round(rawX / GRID_SIZE) * GRID_SIZE : rawX;
   const snappedY = snapToGrid.value ? Math.round(rawY / GRID_SIZE) * GRID_SIZE : rawY;
-  const room = currentRoom.value;
-  const maxX = Math.max(0, (room?.width ?? 1200) - CABINET_CANVAS_SIZE.width);
-  const maxY = Math.max(0, (room?.height ?? 800) - CABINET_CANVAS_SIZE.height);
-  cabinet.x = Math.round(Math.min(maxX, Math.max(0, snappedX)));
-  cabinet.y = Math.round(Math.min(maxY, Math.max(0, snappedY)));
+  cabinet.x = Math.round(Math.max(0, snappedX));
+  cabinet.y = Math.round(Math.max(0, snappedY));
+  dragState.moved = cabinet.x !== dragState.startX || cabinet.y !== dragState.startY;
 }
 
 async function saveCabinetLayout(cabinet: Cabinet): Promise<void> {
@@ -492,8 +519,9 @@ async function endCabinetDrag(): Promise<void> {
   window.removeEventListener("pointermove", moveCabinet);
   if (!dragState) return;
   const cabinet = cabinets.value.find((item) => item.id === dragState?.id);
+  const moved = dragState.moved;
   dragState = undefined;
-  if (!cabinet) return;
+  if (!cabinet || !moved) return;
   try {
     saving.value = true;
     const saved = await api.patch<Cabinet>(`/api/cabinets/${cabinet.id}`, {
@@ -510,11 +538,23 @@ async function endCabinetDrag(): Promise<void> {
   }
 }
 
-let deviceDragState: { id: number; startY: number; startU: number } | undefined;
+let deviceDragState: {
+  id: number;
+  startX: number;
+  startY: number;
+  startU: number;
+  moved: boolean;
+} | undefined;
 function beginDeviceDrag(event: PointerEvent, device: Device): void {
   event.stopPropagation();
   if (!selectedCabinet.value) return;
-  deviceDragState = { id: device.id, startY: event.clientY, startU: device.start_u };
+  deviceDragState = {
+    id: device.id,
+    startX: event.clientX,
+    startY: event.clientY,
+    startU: device.start_u,
+    moved: false
+  };
   selectedDevice.value = device;
   window.addEventListener("pointermove", moveDevice);
   window.addEventListener("pointerup", endDeviceDrag, { once: true });
@@ -522,9 +562,17 @@ function beginDeviceDrag(event: PointerEvent, device: Device): void {
 
 function moveDevice(event: PointerEvent): void {
   if (!deviceDragState || !selectedCabinet.value) return;
+  if (!deviceDragState.moved) {
+    const distance = Math.hypot(
+      event.clientX - deviceDragState.startX,
+      event.clientY - deviceDragState.startY
+    );
+    if (distance < 5) return;
+    deviceDragState.moved = true;
+  }
   const device = cabinetDevices.value.find((item) => item.id === deviceDragState?.id);
   if (!device) return;
-  const deltaU = Math.round((event.clientY - deviceDragState.startY) / (15 * zoom.value)) * -1;
+  const deltaU = Math.round((event.clientY - deviceDragState.startY) / RACK_UNIT_PX) * -1;
   const nextU = Math.max(
     1,
     Math.min(selectedCabinet.value.height_u - device.height_u + 1, deviceDragState.startU + deltaU)
@@ -542,9 +590,12 @@ function moveDevice(event: PointerEvent): void {
 async function endDeviceDrag(): Promise<void> {
   window.removeEventListener("pointermove", moveDevice);
   if (!deviceDragState) return;
+  const moved = deviceDragState.moved;
   const device = cabinetDevices.value.find((item) => item.id === deviceDragState?.id);
   deviceDragState = undefined;
   if (!device) return;
+  if (!moved) return;
+  suppressNextDeviceClick.value = true;
   try {
     saving.value = true;
     const saved = await api.patch<Device>(`/api/devices/${device.id}`, {
@@ -559,9 +610,8 @@ async function endDeviceDrag(): Promise<void> {
       side: device.side,
       status: device.status,
       note: device.note,
-      image_url: device.image_url,
       canvas_width: device.canvas_width,
-      canvas_height: device.canvas_height
+      canvas_height: device.canvas_height,
     });
     devices.value = devices.value.map((item) => (item.id === saved.id ? saved : item));
     allDevices.value = allDevices.value.map((item) => (item.id === saved.id ? saved : item));
@@ -571,6 +621,14 @@ async function endDeviceDrag(): Promise<void> {
   } finally {
     saving.value = false;
   }
+}
+
+async function selectRackDevice(device: Device, face: "front" | "back"): Promise<void> {
+  if (suppressNextDeviceClick.value) {
+    suppressNextDeviceClick.value = false;
+    return;
+  }
+  await selectDevice(device, face);
 }
 
 function startPan(event: PointerEvent): void {
@@ -608,8 +666,6 @@ function openRoomDialog(): void {
   roomForm.value = {
     name: currentRoom.value?.name ?? "",
     code: currentRoom.value?.code ?? "",
-    width: currentRoom.value?.width ?? 1200,
-    height: currentRoom.value?.height ?? 800,
     note: currentRoom.value?.note ?? ""
   };
   roomDialog.value = true;
@@ -640,10 +696,10 @@ function openDeviceDialog(device?: Device): void {
     side: device?.side ?? "front",
     status: device?.status ?? "在用",
     note: device?.note ?? "",
-    image_url: device?.image_url ?? "",
     canvas_width: device?.canvas_width ?? 8,
     canvas_height: device?.canvas_height ?? 3
   };
+  deviceNoteTab.value = "edit";
   deviceDialog.value = true;
 }
 
@@ -653,12 +709,38 @@ function openPortDialog(port?: Port): void {
   portForm.value = {
     name: port?.name ?? `PORT-${String(selectedDevicePorts.value.length + 1).padStart(2, "0")}`,
     port_type: port?.port_type ?? "网口",
-    position: port?.position ?? selectedDevicePorts.value.length,
-    grid_x: port?.grid_x ?? selectedDevicePorts.value.length % (selectedDevice.value.canvas_width || 8),
-    grid_y: port?.grid_y ?? Math.floor(selectedDevicePorts.value.length / (selectedDevice.value.canvas_width || 8)),
+    side: port?.side ?? deviceFace.value,
+    position: port?.position ?? 0,
+    grid_x: port ? port.grid_x + 1 : selectedDevicePorts.value.length % (selectedDevice.value.canvas_width || 8) + 1,
+    grid_y: port ? port.grid_y + 1 : Math.floor(selectedDevicePorts.value.length / (selectedDevice.value.canvas_width || 8)) + 1,
     note: port?.note ?? ""
   };
   portDialog.value = true;
+}
+
+function openPortDialogAtCell(event: MouseEvent): void {
+  if (!selectedDevice.value) return;
+  const point = svgPoint(event);
+  const localX = (point.x - pan.value.x) / zoom.value - 110;
+  const localY = (point.y - pan.value.y) / zoom.value - 105;
+  const gridX = Math.max(
+    1,
+    Math.min(
+      selectedDevice.value.canvas_width,
+      Math.floor((localX - DEVICE_PADDING.x) / deviceCell.value.width) + 1
+    )
+  );
+  const gridY = Math.max(
+    1,
+    Math.min(
+      selectedDevice.value.canvas_height,
+      Math.floor((localY - DEVICE_PADDING.y) / deviceCell.value.height) + 1
+    )
+  );
+  openPortDialog();
+  portForm.value.grid_x = gridX;
+  portForm.value.grid_y = gridY;
+  portForm.value.side = deviceFace.value;
 }
 
 function openPortBatchDialog(): void {
@@ -669,6 +751,7 @@ function openPortBatchDialog(): void {
     start_number: 1,
     count: 24,
     port_type: isFiberBox ? "光口" : "网口",
+    side: deviceFace.value,
     position_start: selectedDevicePorts.value.length,
     note: ""
   };
@@ -696,7 +779,11 @@ async function saveProject(): Promise<void> {
 
 async function saveRoom(): Promise<void> {
   try {
-    const payload = roomForm.value;
+    const payload = {
+      name: roomForm.value.name,
+      code: roomForm.value.code,
+      note: roomForm.value.note
+    };
     const room = editingIds.value.room
       ? await api.patch<Room>(`/api/rooms/${editingIds.value.room}`, payload)
       : await api.post<Room>(`/api/projects/${currentProject.value.id}/rooms`, payload);
@@ -716,8 +803,8 @@ async function saveCabinet(): Promise<void> {
       ? await api.patch<Cabinet>(`/api/cabinets/${editingIds.value.cabinet}`, payload)
       : await api.post<Cabinet>(`/api/rooms/${currentRoom.value.id}/cabinets`, {
           ...payload,
-          x: 80 + cabinets.value.length * 170,
-          y: 110
+          x: 80 + (cabinets.value.length % 4) * 190,
+          y: 90 + Math.floor(cabinets.value.length / 4) * 340
         });
     cabinets.value = editingIds.value.cabinet
       ? cabinets.value.map((item) => (item.id === cabinet.id ? cabinet : item))
@@ -755,9 +842,17 @@ async function saveDevice(): Promise<void> {
 async function savePort(): Promise<void> {
   if (!selectedDevice.value) return;
   try {
+    const payload = {
+      ...portForm.value,
+      grid_x: portForm.value.grid_x - 1,
+      grid_y: portForm.value.grid_y - 1,
+      position: editingIds.value.port
+        ? selectedDevicePorts.value.find((item) => item.id === editingIds.value.port)?.position ?? 0
+        : 0
+    };
     const port = editingIds.value.port
-      ? await api.patch<Port>(`/api/ports/${editingIds.value.port}`, portForm.value)
-      : await api.post<Port>(`/api/devices/${selectedDevice.value.id}/ports`, portForm.value);
+      ? await api.patch<Port>(`/api/ports/${editingIds.value.port}`, payload)
+      : await api.post<Port>(`/api/devices/${selectedDevice.value.id}/ports`, payload);
     ports.value = editingIds.value.port
       ? ports.value.map((item) => (item.id === port.id ? port : item))
       : [...ports.value, port];
@@ -809,14 +904,16 @@ async function removePort(port: Port): Promise<void> {
 }
 
 function openConnectionDialog(source?: Port, target?: Port): void {
-  if (!source || !target) return;
+  if (!source) return;
   editingConnectionId.value = 0;
   connectionForm.value = {
     source_port_id: source.id,
-    target_port_id: target.id,
-    name: `${source.name} → ${target.name}`,
-    cable_type: source.port_type === "光口" || target.port_type === "光口" ? "光纤" : "网线",
-    color: source.port_type === "光口" || target.port_type === "光口" ? "#b46a34" : "#2f7d87",
+    target_port_id: target?.id ?? 0,
+    name: target ? `${source.name} → ${target.name}` : `${source.name} 连接`,
+    cable_type: target && (source.port_type === "光口" || target.port_type === "光口") ? "光纤" : "网线",
+    color: target && (source.port_type === "光口" || target.port_type === "光口")
+      ? CONNECTION_COLORS[0].value
+      : DEFAULT_CONNECTION_COLOR,
     note: ""
   };
   connectionDialog.value = true;
@@ -829,20 +926,15 @@ function openConnectionEditor(connection: Connection): void {
     target_port_id: connection.target_port_id,
     name: connection.name,
     cable_type: connection.cable_type,
-    color: connection.color,
+    color: normalizeConnection(connection).color,
     note: connection.note
   };
   connectionDialog.value = true;
 }
 
-function openPortTopology(port: Port): void {
-  topologyRootPort.value = port;
-  topologyDialog.value = true;
-}
-
 function openConnectionTopology(connection: Connection): void {
-  const port = allPorts.value.find((item) => item.id === connection.source_port_id);
-  if (port) openPortTopology(port);
+  topologyConnection.value = connection;
+  topologyDialog.value = true;
 }
 
 async function focusTopologyPort(port: Port): Promise<void> {
@@ -857,6 +949,10 @@ async function focusTopologyPort(port: Port): Promise<void> {
 }
 
 async function saveConnection(): Promise<void> {
+  if (!connectionForm.value.source_port_id || !connectionForm.value.target_port_id) {
+    ElMessage.warning("请选择起始接口和目标接口。");
+    return;
+  }
   try {
     const connection = editingConnectionId.value
       ? await api.patch<Connection>(
@@ -864,9 +960,10 @@ async function saveConnection(): Promise<void> {
           connectionForm.value
         )
       : await api.post<Connection>("/api/connections", connectionForm.value);
+    const normalized = normalizeConnection(connection);
     connections.value = editingConnectionId.value
-      ? connections.value.map((item) => (item.id === connection.id ? connection : item))
-      : [...connections.value, connection];
+      ? connections.value.map((item) => (item.id === normalized.id ? normalized : item))
+      : [...connections.value, normalized];
     connectionDialog.value = false;
     ElMessage.success(editingConnectionId.value ? "连接已更新" : "连接已保存");
   } catch (error) {
@@ -883,6 +980,10 @@ async function removeConnection(connection: Connection): Promise<void> {
     });
     await api.delete(`/api/connections/${connection.id}`);
     connections.value = connections.value.filter((item) => item.id !== connection.id);
+    if (editingConnectionId.value === connection.id) {
+      connectionDialog.value = false;
+      editingConnectionId.value = 0;
+    }
     ElMessage.success("连接已删除");
   } catch {
     // Cancelled deletion is intentionally silent.
@@ -959,8 +1060,11 @@ function exportProject(): void {
   );
 }
 
-function chooseImport(): void {
-  importInput.value?.click();
+function handleFileCommand(command: string): void {
+  if (command === "import") return;
+  if (command === "export-json") exportProject();
+  if (command === "export-svg") exportSvg();
+  if (command === "export-png") void exportPng();
 }
 
 async function onImportSelected(event: Event): Promise<void> {
@@ -997,8 +1101,8 @@ function exportSvg(): void {
   if (!svg) return;
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-  clone.setAttribute("width", String(currentRoom.value?.width ?? 1200));
-  clone.setAttribute("height", String(currentRoom.value?.height ?? 800));
+  clone.setAttribute("width", String(roomCanvasSize.value.width));
+  clone.setAttribute("height", String(roomCanvasSize.value.height));
   const cssRules = Array.from(document.styleSheets).flatMap((sheet) => {
     try {
       return Array.from(sheet.cssRules).map((rule) => rule.cssText);
@@ -1022,8 +1126,8 @@ async function exportPng(): Promise<void> {
   if (!svg) return;
   const clone = svg.cloneNode(true) as SVGSVGElement;
   clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-  const width = currentRoom.value?.width ?? 1200;
-  const height = currentRoom.value?.height ?? 800;
+  const width = roomCanvasSize.value.width;
+  const height = roomCanvasSize.value.height;
   clone.setAttribute("width", String(width));
   clone.setAttribute("height", String(height));
   const cssRules = Array.from(document.styleSheets).flatMap((sheet) => {
@@ -1137,10 +1241,7 @@ function statusLabel(state: ServiceState): string {
 }
 
 function portPoint(port: Port): { x: number; y: number } {
-  return {
-    x: DEVICE_PADDING.x + (port.grid_x + 0.5) * DEVICE_CELL.width,
-    y: DEVICE_PADDING.y + (port.grid_y + 0.5) * DEVICE_CELL.height
-  };
+  return getPortPoint(port);
 }
 
 function portPointFor(port: Port): { x: number; y: number } {
@@ -1149,7 +1250,10 @@ function portPointFor(port: Port): { x: number; y: number } {
 
 function portLabel(port: Port): string {
   const device = allDevices.value.find((item) => item.id === port.device_id);
-  return `${device?.name ?? "未知设备"} · ${port.name}`;
+  const cabinet = device
+    ? cabinets.value.find((item) => item.id === device.cabinet_id)
+    : undefined;
+  return `${cabinet?.code ?? "未知机柜"} · ${device?.name ?? "未知设备"} · ${port.name}`;
 }
 
 function connectionPeer(connection: Connection): string {
@@ -1161,39 +1265,25 @@ function connectionPeer(connection: Connection): string {
   return port ? portLabel(port) : "未找到对端接口";
 }
 
-function connectionEndpoint(connection: Connection): { local?: Port; peer?: Port } {
-  const localPortIds = new Set(selectedDevicePorts.value.map((port) => port.id));
-  const localId = localPortIds.has(connection.source_port_id)
-    ? connection.source_port_id
-    : connection.target_port_id;
-  const peerId = localId === connection.source_port_id
+function externalConnectionLabel(connection: Connection): string {
+  const visiblePortIds = new Set(visibleDevicePorts.value.map((port) => port.id));
+  const peerId = visiblePortIds.has(connection.source_port_id)
     ? connection.target_port_id
     : connection.source_port_id;
-  return {
-    local: allPorts.value.find((port) => port.id === localId),
-    peer: allPorts.value.find((port) => port.id === peerId)
-  };
+  const port = allPorts.value.find((item) => item.id === peerId);
+  return port ? portLabel(port) : "外部接口";
 }
 
-function connectionLine(connection: Connection, index: number): {
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-} {
-  const endpoint = connectionEndpoint(connection);
-  const local = endpoint.local ? portPointFor(endpoint.local) : { x: 80, y: 255 };
-  const peerIsLocal = endpoint.peer && endpoint.peer.device_id === selectedDevice.value?.id;
-  if (peerIsLocal && endpoint.peer) {
-    const peer = portPointFor(endpoint.peer);
-    return { x1: local.x, y1: local.y, x2: peer.x, y2: peer.y };
-  }
-  return {
-    x1: local.x,
-    y1: local.y,
-    x2: deviceCanvasWidth.value - 28,
-    y2: 116 + index * 34
-  };
+function connectionCurve(connection: Connection, index: number) {
+  const externalIndex = externalCanvasConnectionIds.value.indexOf(connection.id);
+  return buildConnectionCurve(
+    connection,
+    externalIndex >= 0 ? externalIndex : index,
+    allPorts.value,
+    visibleDevicePorts.value,
+    deviceCanvasWidth.value,
+    externalIndex >= 0 ? externalCanvasConnectionIds.value.length : 0
+  );
 }
 
 function deviceCanvasPoint(event: PointerEvent): { x: number; y: number } {
@@ -1228,7 +1318,7 @@ function endPortConnection(event: PointerEvent): void {
   if (!drag) return;
   const targetElement = (event.target as Element | null)?.closest("[data-port-id]");
   const targetId = Number(targetElement?.getAttribute("data-port-id"));
-  const target = selectedDevicePorts.value.find((port) => port.id === targetId);
+  const target = visibleDevicePorts.value.find((port) => port.id === targetId);
   if (target && target.id !== drag.source.id) {
     suppressNextPortClick.value = true;
     openConnectionDialog(drag.source, target);
@@ -1247,12 +1337,6 @@ function selectCanvasPort(port: Port): void {
   } else {
     selectedPort.value = port;
   }
-}
-
-function selectConnectionTarget(port: Port): void {
-  if (!selectedPort.value || selectedPort.value.id === port.id) return;
-  openConnectionDialog(selectedPort.value, port);
-  selectedPort.value = undefined;
 }
 
 function handleShortcut(event: KeyboardEvent): void {
@@ -1282,38 +1366,17 @@ onUnmounted(() => {
 
 <template>
   <div class="app-shell">
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark">DW</div>
-        <div>
-          <p class="eyebrow">设备接线台账</p>
-          <h1>二维可视化编辑器</h1>
-        </div>
-      </div>
-      <div class="top-actions">
-        <el-tag :type="saving ? 'warning' : serviceReady ? 'success' : 'danger'" effect="plain">
-          {{ saving ? "保存中" : serviceLabel }}
-        </el-tag>
-        <el-input
-          v-model="searchQuery"
-          class="search-input"
-          clearable
-          placeholder="搜索设备、IP、接口"
-          @keyup.enter="search"
-        >
-          <template #append><el-button aria-label="搜索" @click="search"><el-icon><Search /></el-icon></el-button></template>
-        </el-input>
-        <el-button size="small" plain @click="exportProject"><el-icon><Link /></el-icon>导出 JSON</el-button>
-        <el-button size="small" plain @click="chooseImport"><el-icon><Plus /></el-icon>导入 JSON</el-button>
-        <el-button size="small" plain @click="exportSvg"><el-icon><MapLocation /></el-icon>导出 SVG</el-button>
-        <el-button size="small" plain @click="exportPng"><el-icon><MapLocation /></el-icon>导出 PNG</el-button>
-        <el-tooltip content="检查服务状态">
-          <el-button size="small" circle plain aria-label="检查服务" @click="checkHealth"><el-icon><Setting /></el-icon></el-button>
-        </el-tooltip>
-        <input ref="importInput" class="hidden-input" type="file" accept="application/json,.json" @change="onImportSelected" />
-      </div>
-    </header>
-
+    <AppTopbar
+      :saving="saving"
+      :service-ready="serviceReady"
+      :service-label="serviceLabel"
+      :search-query="searchQuery"
+      @update:search-query="searchQuery = $event"
+      @search="search"
+      @file-command="handleFileCommand"
+      @check-health="checkHealth"
+      @import-selected="onImportSelected"
+    />
     <main class="workspace">
       <aside class="sidebar">
         <div class="sidebar-head">
@@ -1333,7 +1396,7 @@ onUnmounted(() => {
 
         <div v-if="currentRoom" class="tree">
           <div class="tree-node room-node" :class="{ active: viewMode === 'room' }" @click="setViewMode('room')">
-            <span class="node-icon">⌂</span>
+            <el-icon class="node-icon"><House /></el-icon>
             <span class="node-copy"><strong>{{ currentRoom.name }}</strong><small>{{ currentRoom.code }}</small></span>
             <span class="node-count">{{ cabinets.length }}</span>
           </div>
@@ -1345,7 +1408,7 @@ onUnmounted(() => {
               :class="{ active: selectedCabinet?.id === cabinet.id && viewMode === 'cabinet' }"
               @click="loadCabinet(cabinet)"
             >
-              <span class="node-icon cabinet-icon">▥</span>
+              <el-icon class="node-icon cabinet-icon"><Grid /></el-icon>
               <span class="node-copy"><strong>{{ cabinet.code }}</strong><small>{{ cabinet.name }}</small></span>
               <el-tooltip content="编辑机柜">
                 <el-button text circle size="small" aria-label="编辑机柜" @click.stop="openCabinetDialog(cabinet)"><el-icon><Edit /></el-icon></el-button>
@@ -1362,41 +1425,61 @@ onUnmounted(() => {
       </aside>
 
       <section class="main-panel">
-        <div class="toolbar">
-          <div>
-            <el-breadcrumb separator="/">
-              <el-breadcrumb-item>{{ currentProject?.name }}</el-breadcrumb-item>
-              <el-breadcrumb-item @click="setViewMode('room')">{{ roomTitle }}</el-breadcrumb-item>
-              <el-breadcrumb-item v-if="selectedCabinet" @click="setViewMode('cabinet')">{{ selectedCabinet.code }}</el-breadcrumb-item>
-              <el-breadcrumb-item v-if="viewMode === 'device' && selectedDevice">{{ selectedDevice.name }}</el-breadcrumb-item>
-            </el-breadcrumb>
-            <p class="view-hint">{{ viewMode === "room" ? "机房平面图 · 拖动机柜调整位置" : viewMode === "cabinet" ? "机柜视图 · 拖动设备调整 U 位" : "设备面板 · 端口可用于创建连接" }}</p>
-          </div>
-          <div class="toolbar-actions">
-            <el-button-group>
-              <el-button :type="viewMode === 'room' ? 'primary' : 'default'" @click="setViewMode('room')">机房</el-button>
-              <el-button :type="viewMode === 'cabinet' ? 'primary' : 'default'" :disabled="!selectedCabinet" @click="setViewMode('cabinet')">机柜</el-button>
-              <el-button :type="viewMode === 'device' ? 'primary' : 'default'" :disabled="!selectedDevice" @click="setViewMode('device')">设备</el-button>
-            </el-button-group>
-            <el-tooltip content="缩小">
-              <el-button circle aria-label="缩小" @click="zoomCanvas(-0.1)"><el-icon><ZoomOut /></el-icon></el-button>
-            </el-tooltip>
-            <span class="zoom-value">{{ Math.round(zoom * 100) }}%</span>
-            <el-tooltip content="放大">
-              <el-button circle aria-label="放大" @click="zoomCanvas(0.1)"><el-icon><ZoomIn /></el-icon></el-button>
-            </el-tooltip>
-            <el-switch v-model="snapToGrid" inline-prompt active-text="吸附" inactive-text="自由" />
-            <el-tooltip content="适配画布">
-              <el-button plain aria-label="适配画布" @click="fitCanvas"><el-icon><Expand /></el-icon>适配</el-button>
-            </el-tooltip>
-          </div>
-        </div>
+        <ViewToolbar
+          :view-mode="viewMode"
+          :device-face="deviceFace"
+          :has-cabinet="Boolean(selectedCabinet)"
+          :has-device="Boolean(selectedDevice)"
+          :zoom="zoom"
+          :snap-to-grid="snapToGrid"
+          :room-title="roomTitle"
+          :project-name="currentProject?.name"
+          :cabinet-code="selectedCabinet?.code"
+          :device-name="selectedDevice?.name"
+          @set-view="setViewMode"
+          @set-face="deviceFace = $event; selectedPort = undefined"
+          @zoom="zoomCanvas"
+          @update:snap-to-grid="snapToGrid = $event"
+          @fit="fitCanvas"
+        />
 
         <div v-loading="loading" class="canvas-shell">
+          <div v-if="viewMode === 'cabinet' && selectedCabinet" class="rack-faces">
+            <section v-for="side in ['front', 'back']" :key="side" class="rack-face">
+              <div class="rack-face-head">
+                <strong>{{ selectedCabinet.code }} · {{ sideLabel(side) }}</strong>
+                <span>{{ selectedCabinet.height_u }}U</span>
+              </div>
+              <div class="rack-face-body">
+                <div class="rack-unit-list">
+                  <span v-for="unit in selectedCabinet.height_u" :key="unit">
+                    {{ selectedCabinet.height_u - unit + 1 }}
+                  </span>
+                </div>
+                <div class="rack-slots" :style="{ height: `${selectedCabinet.height_u * RACK_UNIT_PX}px` }">
+                  <button
+                    v-for="device in cabinetDevices"
+                    :key="`${side}-${device.id}`"
+                    class="rack-device"
+                    :class="{ selected: selectedDevice?.id === device.id, 'rack-device-back': side === 'back' }"
+                    :style="rackDeviceStyle(device)"
+                    type="button"
+                    @pointerdown="beginDeviceDrag($event, device)"
+                    @click="selectRackDevice(device, side === 'back' ? 'back' : 'front')"
+                  >
+                    <strong>{{ device.name }}</strong>
+                    <span v-if="device.height_u > 1">U{{ device.start_u }} · {{ device.height_u }}U · {{ device.category }}</span>
+                  </button>
+                  <p v-if="!cabinetDevices.length" class="empty-rack-dom">点击右侧添加设备</p>
+                </div>
+              </div>
+            </section>
+          </div>
           <svg
+            v-else
             ref="svgRef"
             class="workspace-canvas"
-            :viewBox="`0 0 ${currentRoom?.width ?? 1200} ${currentRoom?.height ?? 800}`"
+            :viewBox="`0 0 ${roomCanvasSize.width} ${roomCanvasSize.height}`"
             @pointerdown="startPan"
             @wheel.prevent="zoomCanvas($event.deltaY > 0 ? -0.1 : 0.1, $event)"
           >
@@ -1406,7 +1489,7 @@ onUnmounted(() => {
               </pattern>
             </defs>
             <g :transform="`translate(${pan.x} ${pan.y}) scale(${zoom})`">
-              <rect class="room-surface" x="0" y="0" :width="currentRoom?.width ?? 1200" :height="currentRoom?.height ?? 800" rx="6" />
+              <rect class="room-surface" x="0" y="0" :width="roomCanvasSize.width" :height="roomCanvasSize.height" rx="6" />
               <g v-if="viewMode === 'room'">
                 <g v-for="cabinet in cabinets" :key="cabinet.id" class="canvas-object cabinet-object" :class="{ selected: selectedCabinet?.id === cabinet.id }" :transform="`translate(${cabinet.x} ${cabinet.y})`" @pointerdown="beginCabinetDrag($event, cabinet)" @dblclick.stop="loadCabinet(cabinet)" @click.stop="selectedCabinet = cabinet">
                   <rect class="cabinet-body" width="132" height="270" rx="4" />
@@ -1416,52 +1499,41 @@ onUnmounted(() => {
                   <rect v-for="n in Math.min(cabinet.height_u, 12)" :key="n" class="rack-slot" x="16" :y="65 + (n - 1) * 15" width="100" height="9" rx="2" />
                   <text class="cabinet-meta" x="66" y="252" text-anchor="middle">{{ cabinet.height_u }}U · 双击进入</text>
                 </g>
-                <text v-if="!cabinets.length" class="empty-canvas" x="600" y="380" text-anchor="middle">从左侧新建第一个机柜</text>
-              </g>
-              <g v-else-if="viewMode === 'cabinet' && selectedCabinet" class="rack-view" transform="translate(90 45)">
-                <rect class="rack-frame" width="390" height="690" rx="5" />
-                <text class="rack-title" x="20" y="32">{{ selectedCabinet.code }} · {{ selectedCabinet.name }}</text>
-                <g v-for="unit in selectedCabinet.height_u" :key="unit">
-                  <line class="rack-line" x1="20" :y1="48 + (unit - 1) * 15" x2="370" :y2="48 + (unit - 1) * 15" />
-                  <text class="rack-u" x="31" :y="60 + (unit - 1) * 15">{{ selectedCabinet.height_u - unit + 1 }}</text>
-                </g>
-                <g v-for="device in cabinetDevices" :key="device.id" class="canvas-object device-rack-item" :transform="`translate(52 ${48 + (selectedCabinet.height_u - device.start_u - device.height_u + 1) * 15})`" @pointerdown="beginDeviceDrag($event, device)" @click.stop="selectDevice(device)">
-                  <rect class="device-bar" :class="{ selected: selectedDevice?.id === device.id, 'device-back': device.side === 'back' }" width="295" :height="Math.max(18, device.height_u * 15 - 2)" rx="3" />
-                  <text class="device-label" x="12" y="14">{{ device.name }}</text>
-                  <text class="device-u" x="280" y="14" text-anchor="end">{{ device.height_u }}U · {{ device.side === "back" ? "背" : "正" }}</text>
-                </g>
-                <text v-if="!cabinetDevices.length" class="empty-rack" x="195" y="350" text-anchor="middle">点击右侧添加设备</text>
+                <text v-if="!cabinets.length" class="empty-canvas" :x="roomCanvasSize.width / 2" :y="roomCanvasSize.height / 2" text-anchor="middle">从左侧新建第一个机柜</text>
               </g>
               <g v-else-if="viewMode === 'device' && selectedDevice" class="device-view" transform="translate(110 105)">
-                <defs>
-                  <marker id="connection-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                    <path d="M0,0 L8,4 L0,8 Z" fill="#83939b" />
-                  </marker>
-                </defs>
                 <rect class="device-panel" :width="deviceCanvasWidth" :height="deviceCanvasHeight" rx="6" />
-                <rect class="device-panel-head" :width="deviceCanvasWidth" height="62" rx="6" />
-                <text class="device-panel-title" x="24" y="28">{{ selectedDevice.name }}</text>
-                <text class="device-panel-subtitle" x="24" y="48">{{ selectedDevice.code }} · {{ selectedDevice.category }} · {{ selectedDevice.vendor || "未填写厂商" }}</text>
+                <rect class="device-panel-head" :x="0" y="-18" :width="deviceCanvasWidth" height="54" rx="6" />
+                <text class="device-panel-title" x="24" y="9">{{ selectedDevice.name }}</text>
+                <text class="device-panel-subtitle" x="24" y="28">{{ selectedDevice.code }} · {{ selectedDevice.category }} · {{ sideLabel(deviceFace) }}接口 · {{ selectedDevice.vendor || "未填写厂商" }}</text>
                 <image v-if="selectedDevice.image_url" :href="selectedDevice.image_url" :x="deviceCanvasWidth - 135" y="10" width="110" height="42" preserveAspectRatio="xMidYMid slice" />
                 <g class="device-grid">
+                  <rect
+                    class="device-grid-hit"
+                    :x="DEVICE_PADDING.x"
+                    :y="DEVICE_PADDING.y"
+                    :width="selectedDevice.canvas_width * deviceCell.width"
+                    :height="selectedDevice.canvas_height * deviceCell.height"
+                    @click.stop="openPortDialogAtCell"
+                  />
                   <line
                     v-for="column in selectedDevice.canvas_width + 1"
                     :key="`grid-x-${column}`"
-                    :x1="DEVICE_PADDING.x + (column - 1) * DEVICE_CELL.width"
+                    :x1="DEVICE_PADDING.x + (column - 1) * deviceCell.width"
                     :y1="DEVICE_PADDING.y"
-                    :x2="DEVICE_PADDING.x + (column - 1) * DEVICE_CELL.width"
-                    :y2="DEVICE_PADDING.y + selectedDevice.canvas_height * DEVICE_CELL.height"
+                    :x2="DEVICE_PADDING.x + (column - 1) * deviceCell.width"
+                    :y2="DEVICE_PADDING.y + selectedDevice.canvas_height * deviceCell.height"
                   />
                   <line
                     v-for="row in selectedDevice.canvas_height + 1"
                     :key="`grid-y-${row}`"
                     :x1="DEVICE_PADDING.x"
-                    :y1="DEVICE_PADDING.y + (row - 1) * DEVICE_CELL.height"
-                    :x2="DEVICE_PADDING.x + selectedDevice.canvas_width * DEVICE_CELL.width"
-                    :y2="DEVICE_PADDING.y + (row - 1) * DEVICE_CELL.height"
+                    :y1="DEVICE_PADDING.y + (row - 1) * deviceCell.height"
+                    :x2="DEVICE_PADDING.x + selectedDevice.canvas_width * deviceCell.width"
+                    :y2="DEVICE_PADDING.y + (row - 1) * deviceCell.height"
                   />
                 </g>
-                <g v-for="port in selectedDevicePorts" :key="port.id" class="port-handle canvas-object" :data-port-id="port.id" @pointerdown="beginPortConnection($event, port)" @click.stop="selectCanvasPort(port)">
+                <g v-for="port in visibleDevicePorts" :key="port.id" class="port-handle canvas-object" :data-port-id="port.id" @pointerdown="beginPortConnection($event, port)" @click.stop="selectCanvasPort(port)">
                   <circle :cx="portPoint(port).x" :cy="portPoint(port).y" r="10" :class="{ 'port-selected': selectedPort?.id === port.id, 'port-connected': connectedPortIds.has(port.id) }" />
                   <text class="port-name" :x="portPoint(port).x" :y="portPoint(port).y + 25" text-anchor="middle">{{ port.name }}</text>
                 </g>
@@ -1473,26 +1545,27 @@ onUnmounted(() => {
                   :x2="portDragState.point.x"
                   :y2="portDragState.point.y"
                 />
-                <g v-for="(connection, index) in visibleConnections" :key="connection.id">
-                  <line
+                <g v-for="(connection, index) in canvasConnections" :key="connection.id" class="connection-group" @click.stop="openConnectionEditor(connection)">
+                  <path
+                    class="connection-hit-area"
+                    :d="connectionCurve(connection, index).d"
+                  />
+                  <path
                     class="connection-line"
                     :stroke="connection.color"
-                    :x1="connectionLine(connection, index).x1"
-                    :y1="connectionLine(connection, index).y1"
-                    :x2="connectionLine(connection, index).x2"
-                    :y2="connectionLine(connection, index).y2"
-                    :marker-end="connectionEndpoint(connection).peer?.device_id === selectedDevice?.id ? undefined : 'url(#connection-arrow)'"
-                    @click.stop="openConnectionEditor(connection)"
+                    :d="connectionCurve(connection, index).d"
                   />
-                  <text class="connection-label" :x="deviceCanvasWidth - 42" :y="119 + index * 34" text-anchor="end" @click.stop="openConnectionEditor(connection)">{{ connection.name || connectionPeer(connection) }}</text>
+                  <polygon v-if="connectionCurve(connection, index).arrow" class="connection-arrow" :fill="connection.color" :points="connectionCurve(connection, index).arrow" />
+                  <circle v-if="connectionCurve(connection, index).anchor" class="connection-rail-anchor" :cx="connectionCurve(connection, index).anchor?.x" :cy="connectionCurve(connection, index).anchor?.y" r="5" />
+                  <text v-if="connectionCurve(connection, index).anchor" class="connection-label" :x="connectionCurve(connection, index).anchor?.x" :y="(connectionCurve(connection, index).anchor?.y ?? 0) - 8" text-anchor="middle" @click.stop="openConnectionEditor(connection)">{{ externalConnectionLabel(connection) }}</text>
                 </g>
-                <text v-if="!selectedDevicePorts.length" class="empty-device" :x="deviceCanvasWidth / 2" :y="deviceCanvasHeight / 2" text-anchor="middle">在右侧添加接口</text>
-                <text v-else-if="!selectedPort" class="device-instruction" :x="deviceCanvasWidth / 2" :y="deviceCanvasHeight - 28" text-anchor="middle">点击接口选择起点，再点击目标接口创建连接</text>
+                <text v-if="!visibleDevicePorts.length" class="empty-device" :x="deviceCanvasWidth / 2" :y="deviceCanvasHeight / 2" text-anchor="middle">单击网格创建{{ sideLabel(deviceFace) }}接口</text>
+                <text v-else-if="!selectedPort" class="device-instruction" :x="deviceCanvasWidth / 2" :y="deviceCanvasHeight - 28" text-anchor="middle">单击空格新增接口；点击接口选择起点，再点目标接口连线</text>
                 <text v-else class="device-instruction selected-instruction" :x="deviceCanvasWidth / 2" :y="deviceCanvasHeight - 28" text-anchor="middle">已选择 {{ selectedPort.name }}，请点击目标接口</text>
               </g>
             </g>
           </svg>
-          <div class="canvas-legend">
+          <div v-if="viewMode !== 'cabinet'" class="canvas-legend">
             <span><i class="legend-cabinet"></i>机柜</span>
             <span><i class="legend-device"></i>设备</span>
             <span><i class="legend-selected"></i>已选中</span>
@@ -1512,12 +1585,11 @@ onUnmounted(() => {
           <div class="summary-block">
             <span>机房编号</span><strong>{{ currentRoom?.code }}</strong>
             <span>机柜数量</span><strong>{{ cabinets.length }}</strong>
-            <span>画布尺寸</span><strong>{{ currentRoom?.width }} × {{ currentRoom?.height }}</strong>
           </div>
           <div class="inspector-section">
             <div class="section-title"><span>机柜列表</span><el-button text type="primary" @click="openCabinetDialog()"><el-icon><Plus /></el-icon>添加</el-button></div>
             <button v-for="cabinet in cabinets" :key="cabinet.id" class="object-row" type="button" @click="loadCabinet(cabinet)">
-              <span class="row-symbol">▥</span><span><strong>{{ cabinet.code }}</strong><small>{{ cabinet.name }} · {{ cabinet.height_u }}U</small></span><span>›</span>
+              <el-icon class="row-symbol"><Grid /></el-icon><span><strong>{{ cabinet.code }}</strong><small>{{ cabinet.name }} · {{ cabinet.height_u }}U</small></span><el-icon class="row-arrow"><ArrowRight /></el-icon>
             </button>
           </div>
         </template>
@@ -1543,29 +1615,43 @@ onUnmounted(() => {
             <el-button plain size="small"><el-icon><Plus /></el-icon>上传设备图片</el-button>
           </el-upload>
           <el-button v-if="selectedDevice.image_url" class="image-delete" text type="danger" size="small" @click="removeDeviceImage">删除图片</el-button>
-          <div class="summary-block">
-            <span>设备编号</span><strong>{{ selectedDevice.code }}</strong>
-            <span>厂商 / 型号</span><strong>{{ selectedDevice.vendor || "未填写" }} {{ selectedDevice.model }}</strong>
-            <span>管理地址</span><strong>{{ selectedDevice.management_ip || "未填写" }}</strong>
-            <span>机柜位置</span><strong>U{{ selectedDevice.start_u }} · {{ selectedDevice.height_u }}U · {{ selectedDevice.side === "back" ? "背面" : "正面" }}</strong>
+          <div class="device-info-panel">
+            <div class="device-info-head">
+              <span>设备参数与备注</span>
+              <el-button text size="small" @click="deviceNoteExpanded = !deviceNoteExpanded">
+                <el-icon><component :is="deviceNoteExpanded ? ArrowUp : ArrowDown" /></el-icon>
+                {{ deviceNoteExpanded ? "收起" : "展开" }}
+              </el-button>
+            </div>
+            <div class="device-info-body" :class="{ collapsed: !deviceNoteExpanded }">
+              <div class="summary-block">
+                <span>设备编号</span><strong>{{ selectedDevice.code }}</strong>
+                <span>厂商 / 型号</span><strong>{{ selectedDevice.vendor || "未填写" }} {{ selectedDevice.model }}</strong>
+                <span>管理地址</span><strong>{{ selectedDevice.management_ip || "未填写" }}</strong>
+                <span>机柜位置</span><strong>U{{ selectedDevice.start_u }} · {{ selectedDevice.height_u }}U</strong>
+              </div>
+              <div class="note-box markdown-preview" v-html="markdownToHtml(selectedDevice.note || '暂无设备备注。')"></div>
+            </div>
           </div>
-          <p class="note-box">{{ selectedDevice.note || "暂无设备备注。" }}</p>
           <div class="inspector-section">
             <div class="section-title">
               <span>接口 · {{ selectedDevicePorts.length }}</span>
               <span class="section-actions">
                 <el-button text type="primary" @click="openPortDialog()"><el-icon><Plus /></el-icon>添加</el-button>
-                <el-button text type="primary" @click="openPortBatchDialog"><el-icon><ConnectionIcon /></el-icon>批量生成</el-button>
+              <el-button text type="primary" @click="openPortBatchDialog"><el-icon><Plus /></el-icon>批量生成</el-button>
               </span>
             </div>
             <div v-for="port in selectedDevicePorts" :key="port.id" class="object-row port-row">
               <span class="port-dot" :class="{ connected: connectedPortIds.has(port.id) }"></span>
-              <button class="row-main-button" type="button" @click="openPortDialog(port)">
+              <div class="row-main-button">
                 <strong>{{ port.name }}</strong>
-                <small>{{ port.port_type }} · {{ connectedPortIds.has(port.id) ? "已连接" : "未连接" }}{{ port.note ? ` · ${port.note}` : "" }}</small>
-              </button>
-              <el-tooltip content="查看链路">
-                <el-button text circle size="small" aria-label="查看链路" @click="openPortTopology(port)"><el-icon><ConnectionIcon /></el-icon></el-button>
+                <small>{{ sideLabel(port.side) }} · {{ port.port_type }} · {{ connectedPortIds.has(port.id) ? "已连接" : "未连接" }}{{ port.note ? ` · ${port.note}` : "" }}</small>
+              </div>
+              <el-tooltip content="编辑接口">
+                <el-button text circle size="small" aria-label="编辑接口" @click.stop="openPortDialog(port)"><el-icon><EditPen /></el-icon></el-button>
+              </el-tooltip>
+              <el-tooltip content="创建连接">
+                <el-button text circle size="small" aria-label="创建连接" @click.stop="openConnectionDialog(port)"><el-icon><Plus /></el-icon></el-button>
               </el-tooltip>
             </div>
             <el-empty v-if="!selectedDevicePorts.length" description="还没有接口" :image-size="50" />
@@ -1576,26 +1662,11 @@ onUnmounted(() => {
               <span class="connection-swatch" :style="{ backgroundColor: connection.color }"></span>
               <span><strong>{{ connection.name || "未命名连接" }}</strong><small>{{ connectionPeer(connection) }}</small></span>
               <el-tooltip content="查看上下游">
-                <el-button text circle size="small" aria-label="查看上下游" @click="openConnectionTopology(connection)"><el-icon><ConnectionIcon /></el-icon></el-button>
+                <el-button text circle size="small" aria-label="查看上下游" @click="openConnectionTopology(connection)"><el-icon><View /></el-icon></el-button>
               </el-tooltip>
               <el-button text type="danger" size="small" @click="removeConnection(connection)"><el-icon><Delete /></el-icon>删除</el-button>
             </div>
             <el-empty v-if="!visibleConnections.length" description="暂无连接" :image-size="45" />
-          </div>
-          <div class="inspector-section">
-            <div class="section-title"><span>拖线目标</span><small>可拖到目标接口</small></div>
-            <button
-              v-for="{ port, device } in connectionTargetPorts"
-              :key="`target-${port.id}`"
-              class="object-row port-row"
-              type="button"
-              :data-port-id="port.id"
-              @pointerup="portDragState && selectConnectionTarget(port)"
-              @click="selectConnectionTarget(port)"
-            >
-              <span class="port-dot"></span><span><strong>{{ port.name }}</strong><small>{{ device?.name ?? "未知设备" }} · {{ port.port_type }}</small></span><el-icon><ArrowRight /></el-icon>
-            </button>
-            <p v-if="!connectionTargetPorts.length" class="target-empty">当前项目没有其他设备接口。</p>
           </div>
           <el-button class="full-button danger-button" plain @click="removeSelectedDevice"><el-icon><Delete /></el-icon>删除设备</el-button>
         </template>
@@ -1612,7 +1683,7 @@ onUnmounted(() => {
           <div class="inspector-section">
             <div class="section-title"><span>设备</span><el-button text type="primary" @click="openDeviceDialog()"><el-icon><Plus /></el-icon>添加</el-button></div>
             <button v-for="device in cabinetDevices" :key="device.id" class="object-row" type="button" @click="selectDevice(device)">
-              <span class="row-symbol device-symbol">□</span><span><strong>{{ device.name }}</strong><small>{{ device.category }} · U{{ device.start_u }}</small></span><span>›</span>
+              <el-icon class="row-symbol device-symbol"><Box /></el-icon><span><strong>{{ device.name }}</strong><small>{{ device.category }} · U{{ device.start_u }}</small></span><el-icon class="row-arrow"><ArrowRight /></el-icon>
             </button>
             <el-empty v-if="!cabinetDevices.length" description="添加第一台设备" :image-size="50" />
           </div>
@@ -1634,7 +1705,6 @@ onUnmounted(() => {
       <el-form label-position="top">
         <el-form-item label="机房名称"><el-input v-model="roomForm.name" /></el-form-item>
         <el-form-item label="机房编号"><el-input v-model="roomForm.code" :disabled="Boolean(editingIds.room)" /></el-form-item>
-        <div class="form-grid"><el-form-item label="画布宽度"><el-input-number v-model="roomForm.width" :min="400" /></el-form-item><el-form-item label="画布高度"><el-input-number v-model="roomForm.height" :min="300" /></el-form-item></div>
         <el-form-item label="备注"><el-input v-model="roomForm.note" type="textarea" :rows="3" /></el-form-item>
       </el-form>
       <template #footer><el-button @click="roomDialog = false">取消</el-button><el-button type="primary" @click="saveRoom">保存</el-button></template>
@@ -1649,40 +1719,55 @@ onUnmounted(() => {
       <template #footer><el-button @click="cabinetDialog = false">取消</el-button><el-button type="primary" @click="saveCabinet">保存</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="deviceDialog" :title="editingIds.device ? '编辑设备' : '新建设备'" width="620px">
+    <el-dialog
+      v-model="deviceDialog"
+      class="device-dialog"
+      :title="editingIds.device ? '编辑设备' : '新建设备'"
+      width="620px"
+    >
       <el-form label-position="top">
         <div class="form-grid"><el-form-item label="设备名称"><el-input v-model="deviceForm.name" /></el-form-item><el-form-item label="设备编号"><el-input v-model="deviceForm.code" /></el-form-item></div>
         <div class="form-grid"><el-form-item label="分类"><el-select v-model="deviceForm.category" class="wide-input"><el-option label="交换机" value="交换机" /><el-option label="路由器" value="路由器" /><el-option label="服务器" value="服务器" /><el-option label="配线架" value="配线架" /><el-option label="其他" value="其他" /></el-select></el-form-item><el-form-item label="状态"><el-select v-model="deviceForm.status" class="wide-input"><el-option label="在用" value="在用" /><el-option label="备用" value="备用" /><el-option label="故障" value="故障" /><el-option label="停用" value="停用" /></el-select></el-form-item></div>
         <div class="form-grid"><el-form-item label="厂商"><el-input v-model="deviceForm.vendor" /></el-form-item><el-form-item label="型号"><el-input v-model="deviceForm.model" /></el-form-item></div>
-        <div class="form-grid"><el-form-item label="管理 IP"><el-input v-model="deviceForm.management_ip" /></el-form-item><el-form-item label="面"><el-select v-model="deviceForm.side" class="wide-input"><el-option label="正面" value="front" /><el-option label="背面" value="back" /></el-select></el-form-item></div>
+        <div class="form-grid"><el-form-item label="管理 IP"><el-input v-model="deviceForm.management_ip" /></el-form-item><el-form-item label="安装面参考"><el-select v-model="deviceForm.side" class="wide-input"><el-option label="正面" value="front" /><el-option label="背面" value="back" /></el-select></el-form-item></div>
         <div class="form-grid"><el-form-item label="起始 U 位"><el-input-number v-model="deviceForm.start_u" :min="1" /></el-form-item><el-form-item label="占用高度"><el-input-number v-model="deviceForm.height_u" :min="1" /></el-form-item></div>
         <div class="form-grid"><el-form-item label="设备网格列"><el-input-number v-model="deviceForm.canvas_width" :min="2" :max="40" /></el-form-item><el-form-item label="设备网格行"><el-input-number v-model="deviceForm.canvas_height" :min="2" :max="20" /></el-form-item></div>
-        <el-form-item label="设备图片地址"><el-input v-model="deviceForm.image_url" placeholder="可填写服务器图片地址" /></el-form-item>
-        <el-form-item label="备注"><el-input v-model="deviceForm.note" type="textarea" :rows="4" /></el-form-item>
+        <el-form-item label="备注">
+          <el-tabs v-model="deviceNoteTab" class="note-tabs">
+            <el-tab-pane label="编辑" name="edit"><el-input class="device-note-input" v-model="deviceForm.note" type="textarea" :rows="6" placeholder="支持 Markdown，例如 **重点**、- 条目、`命令`" /></el-tab-pane>
+            <el-tab-pane label="预览" name="preview"><div class="markdown-preview" v-html="markdownToHtml(deviceForm.note)"></div></el-tab-pane>
+          </el-tabs>
+        </el-form-item>
       </el-form>
       <template #footer><el-button @click="deviceDialog = false">取消</el-button><el-button type="primary" @click="saveDevice">保存</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="portDialog" :title="editingIds.port ? '编辑接口' : '新增接口'" width="460px">
+    <el-dialog
+      v-model="portDialog"
+      class="port-dialog"
+      :title="editingIds.port ? '编辑接口' : '新增接口'"
+      width="460px"
+    >
       <el-form label-position="top">
         <div class="form-grid"><el-form-item label="接口名称"><el-input v-model="portForm.name" /></el-form-item><el-form-item label="接口类型"><el-select v-model="portForm.port_type" class="wide-input"><el-option label="网口" value="网口" /><el-option label="光口" value="光口" /><el-option label="电源口" value="电源口" /><el-option label="串口" value="串口" /></el-select></el-form-item></div>
+        <el-form-item label="所在面"><el-segmented v-model="portForm.side" :options="[{ label: '正面', value: 'front' }, { label: '背面', value: 'back' }]" /></el-form-item>
         <div class="form-grid">
-          <el-form-item label="显示顺序"><el-input-number v-model="portForm.position" :min="0" /></el-form-item>
-          <el-form-item label="网格列"><el-input-number v-model="portForm.grid_x" :min="0" :max="(selectedDevice?.canvas_width ?? 8) - 1" /></el-form-item>
+          <el-form-item label="网格列（从 1 开始）"><el-input-number v-model="portForm.grid_x" :min="1" :max="selectedDevice?.canvas_width ?? 8" /></el-form-item>
+          <el-form-item label="网格行（从 1 开始）"><el-input-number v-model="portForm.grid_y" :min="1" :max="selectedDevice?.canvas_height ?? 3" /></el-form-item>
         </div>
-        <el-form-item label="网格行"><el-input-number v-model="portForm.grid_y" :min="0" :max="(selectedDevice?.canvas_height ?? 3) - 1" /></el-form-item>
-        <el-form-item label="备注"><el-input v-model="portForm.note" type="textarea" :rows="3" /></el-form-item>
+          <el-form-item label="备注"><el-input v-model="portForm.note" type="textarea" :rows="3" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button
           v-if="editingIds.port"
+          class="port-delete-button"
           type="danger"
           plain
           @click="removePort(selectedDevicePorts.find((item) => item.id === editingIds.port)!)"
         >删除接口</el-button>
         <span class="dialog-spacer"></span>
-        <el-button @click="portDialog = false">取消</el-button>
-        <el-button type="primary" @click="savePort">保存</el-button>
+        <el-button class="port-cancel-button" @click="portDialog = false">取消</el-button>
+        <el-button class="port-save-button" type="primary" @click="savePort">保存</el-button>
       </template>
     </el-dialog>
 
@@ -1694,84 +1779,113 @@ onUnmounted(() => {
         </div>
         <div class="form-grid">
           <el-form-item label="数量"><el-input-number v-model="portBatchForm.count" :min="1" :max="256" /></el-form-item>
-          <el-form-item label="起始顺序"><el-input-number v-model="portBatchForm.position_start" :min="0" /></el-form-item>
+          <div></div>
         </div>
         <el-form-item label="接口类型"><el-select v-model="portBatchForm.port_type" class="wide-input"><el-option label="网口" value="网口" /><el-option label="光口" value="光口" /><el-option label="电源口" value="电源口" /><el-option label="串口" value="串口" /></el-select></el-form-item>
+        <el-form-item label="所在面"><el-segmented v-model="portBatchForm.side" :options="[{ label: '正面', value: 'front' }, { label: '背面', value: 'back' }]" /></el-form-item>
         <el-form-item label="统一备注"><el-input v-model="portBatchForm.note" type="textarea" :rows="2" /></el-form-item>
       </el-form>
       <template #footer><el-button @click="portBatchDialog = false">取消</el-button><el-button type="primary" @click="savePortBatch">生成接口</el-button></template>
     </el-dialog>
 
-    <el-dialog v-model="connectionDialog" :title="editingConnectionId ? '编辑连接' : '创建连接'" width="520px">
+    <el-dialog
+      v-model="connectionDialog"
+      class="connection-dialog"
+      :title="editingConnectionId ? '编辑连接' : '创建连接'"
+      width="520px"
+    >
       <el-form label-position="top">
         <el-form-item label="起始接口">
-          <el-select v-model="connectionForm.source_port_id" class="wide-input" filterable>
+          <el-select v-model="connectionForm.source_port_id" class="wide-input" filterable :disabled="Boolean(editingConnectionId)">
             <el-option v-for="{ port } in allPortsWithDevices" :key="port.id" :label="portLabel(port)" :value="port.id" />
           </el-select>
         </el-form-item>
         <el-form-item label="目标接口">
           <el-select v-model="connectionForm.target_port_id" class="wide-input" filterable>
-            <el-option v-for="{ port } in allPortsWithDevices" :key="port.id" :label="portLabel(port)" :value="port.id" />
+            <el-option v-for="{ port } in connectionPortOptions" :key="port.id" :label="portLabel(port)" :value="port.id" />
           </el-select>
         </el-form-item>
         <div class="form-grid">
           <el-form-item label="连接名称"><el-input v-model="connectionForm.name" /></el-form-item>
           <el-form-item label="线缆类型"><el-select v-model="connectionForm.cable_type" class="wide-input"><el-option label="网线" value="网线" /><el-option label="光纤" value="光纤" /><el-option label="电源线" value="电源线" /><el-option label="其他" value="其他" /></el-select></el-form-item>
         </div>
-        <el-form-item label="线路颜色"><el-color-picker v-model="connectionForm.color" show-alpha /></el-form-item>
+        <el-form-item label="线路颜色">
+          <el-select v-model="connectionForm.color" class="wide-input">
+            <el-option v-for="color in CONNECTION_COLORS" :key="color.value" :label="color.label" :value="color.value">
+              <span class="color-option"><i class="color-swatch" :style="{ backgroundColor: color.value }"></i>{{ color.label }}</span>
+            </el-option>
+          </el-select>
+        </el-form-item>
         <el-form-item label="备注"><el-input v-model="connectionForm.note" type="textarea" :rows="3" /></el-form-item>
       </el-form>
       <template #footer>
-        <el-button v-if="editingConnectionId" type="danger" plain @click="removeConnection(connections.find((item) => item.id === editingConnectionId)!)">删除连接</el-button>
+        <el-button
+          v-if="editingConnectionId"
+          class="connection-delete-button"
+          type="danger"
+          plain
+          @click="removeConnection(connections.find((item) => item.id === editingConnectionId)!)"
+        >删除连接</el-button>
         <span class="dialog-spacer"></span>
-        <el-button @click="connectionDialog = false">取消</el-button><el-button type="primary" @click="saveConnection">{{ editingConnectionId ? "保存修改" : "保存连接" }}</el-button>
+        <el-button class="connection-cancel-button" @click="connectionDialog = false">取消</el-button>
+        <el-button class="connection-save-button" type="primary" @click="saveConnection">{{ editingConnectionId ? "保存修改" : "保存连接" }}</el-button>
       </template>
     </el-dialog>
 
     <el-dialog v-model="topologyDialog" title="接口链路" width="620px">
-      <el-descriptions v-if="topologyRootPort" :column="2" border size="small" class="topology-summary">
-        <el-descriptions-item label="起点设备">{{ allDevices.find((item) => item.id === topologyRootPort?.device_id)?.name }}</el-descriptions-item>
-        <el-descriptions-item label="起点接口">{{ topologyRootPort.name }}</el-descriptions-item>
-      </el-descriptions>
-      <el-divider content-position="left">上一跳 / 下一跳</el-divider>
-      <el-empty v-if="topologySteps.length <= 1" description="该接口暂无连接链路" />
-      <el-timeline v-else class="topology-timeline">
-        <el-timeline-item v-for="step in topologySteps" :key="step.port.id" :type="step.depth === 0 ? 'primary' : 'success'">
-          <div class="topology-step">
-            <el-tag size="small" :type="step.depth === 0 ? 'primary' : 'info'">{{ step.direction }}</el-tag>
-            <button class="topology-link" type="button" @click="focusTopologyPort(step.port)">
-              {{ step.device?.name ?? "未知设备" }} · {{ step.port.name }}
-            </button>
-            <span v-if="step.connection" class="topology-connection">
-              {{ step.connection.name || "未命名连接" }} · {{ step.connection.cable_type }}
-            </span>
+      <el-empty v-if="!topologyDetail" description="该连接暂无链路信息" />
+      <div v-else class="topology-route">
+        <div class="topology-endpoint">
+          <el-tag size="small" type="primary">起点</el-tag>
+          <button class="topology-link" type="button" @click="focusTopologyPort(topologyDetail.sourcePort)">
+            {{ topologyDetail.sourceDevice?.name ?? "未知设备" }} · {{ topologyDetail.sourcePort.name }}
+          </button>
+        </div>
+        <div class="topology-connection-card">
+          <div class="topology-connection-head">
+            <span class="topology-connection-title">{{ topologyDetail.connection.name || "未命名连接" }}</span>
+            <el-button text circle size="small" aria-label="编辑连接" @click="openConnectionEditor(topologyDetail.connection)"><el-icon><EditPen /></el-icon></el-button>
           </div>
-        </el-timeline-item>
-      </el-timeline>
+          <div class="topology-connection-meta">
+            <el-tag size="small" effect="plain">{{ topologyDetail.connection.cable_type }}</el-tag>
+            <span class="topology-connection-color"><i class="connection-swatch" :style="{ backgroundColor: topologyDetail.connection.color }"></i>线路</span>
+          </div>
+          <div class="topology-note-block">
+            <span>业务备注</span>
+            <p>{{ topologyDetail.connection.note || "未填写业务备注" }}</p>
+          </div>
+        </div>
+        <div class="topology-endpoint">
+          <el-tag size="small" type="success">终点</el-tag>
+          <button class="topology-link" type="button" @click="focusTopologyPort(topologyDetail.targetPort)">
+            {{ topologyDetail.targetDevice?.name ?? "未知设备" }} · {{ topologyDetail.targetPort.name }}
+          </button>
+        </div>
+      </div>
       <template #footer><el-button @click="topologyDialog = false">关闭</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="searchOpen" title="搜索结果" width="560px">
       <div v-if="searchResults" class="search-results">
         <button v-for="room in searchResults.rooms" :key="`room-${room.id}`" class="search-result" type="button" @click="focusSearchRoom(room)">
-          <span class="row-symbol">⌂</span>
+          <el-icon class="row-symbol"><House /></el-icon>
           <span><strong>{{ room.name }}</strong><small>机房 · {{ room.code }}</small></span>
-          <span>›</span>
+          <el-icon class="row-arrow"><ArrowRight /></el-icon>
         </button>
         <button v-for="cabinet in searchResults.cabinets" :key="`cabinet-${cabinet.id}`" class="search-result" type="button" @click="focusSearchCabinet(cabinet)">
-          <span class="row-symbol">▥</span>
+          <el-icon class="row-symbol"><Grid /></el-icon>
           <span><strong>{{ cabinet.name }}</strong><small>机柜 · {{ cabinet.code }}</small></span>
-          <span>›</span>
+          <el-icon class="row-arrow"><ArrowRight /></el-icon>
         </button>
         <button v-for="device in searchResults.devices" :key="`device-${device.id}`" class="search-result" type="button" @click="focusSearchDevice(device)">
-          <span class="row-symbol device-symbol">□</span>
+          <el-icon class="row-symbol device-symbol"><Box /></el-icon>
           <span><strong>{{ device.name }}</strong><small>{{ device.code }} · {{ device.category }} · {{ device.management_ip || "无管理 IP" }}</small></span>
-          <span>›</span>
+          <el-icon class="row-arrow"><ArrowRight /></el-icon>
         </button>
         <button v-for="port in searchResults.ports" :key="`port-${port.id}`" class="search-result" type="button" @click="focusSearchPort(port)">
           <span class="port-dot connected"></span>
-          <span><strong>{{ port.name }}</strong><small>接口 · {{ port.port_type }}{{ port.note ? ` · ${port.note}` : "" }}</small></span>
-          <span>›</span>
+          <span><strong>{{ port.name }}</strong><small>接口 · {{ sideLabel(port.side) }} · {{ port.port_type }}{{ port.note ? ` · ${port.note}` : "" }}</small></span>
+          <el-icon class="row-arrow"><ArrowRight /></el-icon>
         </button>
         <div v-if="!searchResults.rooms.length && !searchResults.cabinets.length && !searchResults.devices.length && !searchResults.ports.length" class="search-empty">没有找到匹配对象，可尝试搜索名称、编号、IP 或备注。</div>
       </div>

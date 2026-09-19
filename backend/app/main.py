@@ -430,6 +430,7 @@ def create_ports_bulk(device_id: int, payload: PortBatchCreate, db: Session = De
             device_id=device_id,
             name=f"{payload.prefix}{payload.start_number + index}",
             port_type=payload.port_type,
+            side=payload.side,
             position=payload.position_start + index,
             grid_x=index % device.canvas_width,
             grid_y=index // device.canvas_width,

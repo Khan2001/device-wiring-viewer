@@ -43,6 +43,8 @@ export interface Device {
   image_url: string;
   canvas_width: number;
   canvas_height: number;
+  cell_width: number;
+  cell_height: number;
 }
 
 export interface Port {
@@ -50,6 +52,7 @@ export interface Port {
   device_id: number;
   name: string;
   port_type: string;
+  side: string;
   position: number;
   grid_x: number;
   grid_y: number;
@@ -61,6 +64,7 @@ export interface PortBatchCreate {
   start_number: number;
   count: number;
   port_type: string;
+  side: string;
   position_start: number;
   note: string;
 }

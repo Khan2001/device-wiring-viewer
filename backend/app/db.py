@@ -25,10 +25,23 @@ def create_tables() -> None:
             "ALTER TABLE devices ADD COLUMN IF NOT EXISTS canvas_height INTEGER NOT NULL DEFAULT 3"
         ))
         connection.execute(text(
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS cell_width INTEGER NOT NULL DEFAULT 64"
+        ))
+        connection.execute(text(
+            "ALTER TABLE devices ADD COLUMN IF NOT EXISTS cell_height INTEGER NOT NULL DEFAULT 52"
+        ))
+        connection.execute(text(
             "ALTER TABLE ports ADD COLUMN IF NOT EXISTS grid_x INTEGER NOT NULL DEFAULT 0"
         ))
         connection.execute(text(
             "ALTER TABLE ports ADD COLUMN IF NOT EXISTS grid_y INTEGER NOT NULL DEFAULT 0"
+        ))
+        connection.execute(text(
+            "ALTER TABLE ports ADD COLUMN IF NOT EXISTS side VARCHAR(20) NOT NULL DEFAULT 'front'"
+        ))
+        connection.execute(text(
+            "UPDATE connections SET color = '#6b7280' "
+            "WHERE color NOT IN ('#202124', '#6b7280', '#d64545', '#2864c7')"
         ))
         connection.execute(text(
             "UPDATE ports SET grid_x = MOD(position, 8), grid_y = FLOOR(position / 8) "
